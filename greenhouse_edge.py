@@ -4,7 +4,7 @@
 Firebase: необов'язкова реальна інтеграція через service-account JSON та FIREBASE_DATABASE_URL.
 """
 from pathlib import Path
-import os, json, sqlite3, gzip, zlib, bz2, io
+import os, json, sqlite3, gzip, zlib, bz2, base64, hashlib
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -103,26 +103,80 @@ def report(df,n,best,summary):
     (OUT/'report.txt').write_text('\n'.join(lines),encoding='utf8')
     print('\n'.join(lines))
 
-def firebase_upload(df):
-    """Тільки при явному налаштуванні облікових даних виконує справжній запис."""
-    key=os.getenv('FIREBASE_SERVICE_ACCOUNT_JSON')
-    url=os.getenv('FIREBASE_DATABASE_URL')
-    if not(key and url):
-        (OUT/'firebase_status.txt').write_text('Firebase не налаштовано: немає FIREBASE_SERVICE_ACCOUNT_JSON та FIREBASE_DATABASE_URL. Локальний експорт готовий; запис у хмару НЕ виконано.',encoding='utf8')
+def firebase_upload(df, best):
+    """Надсилає до Firebase саме стиснений набір, отримує та перевіряє його.
+
+    Без змінних середовища працює тільки локальна частина. Ключ Firebase
+    ніколи не зберігається у звітах або програмних файлах.
+    """
+    key = os.getenv('FIREBASE_SERVICE_ACCOUNT_JSON')
+    url = os.getenv('FIREBASE_DATABASE_URL')
+    if not (key and url):
+        (OUT/'firebase_status.txt').write_text(
+            'Firebase не налаштовано: локальний аналіз виконано; хмарний запис НЕ виконано.',
+            encoding='utf8')
         return False
+
+    if not Path(key).is_file():
+        raise FileNotFoundError('JSON-ключ Firebase не знайдено у вказаному шляху')
+
     import firebase_admin
-    from firebase_admin import credentials,db
+    from firebase_admin import credentials, db
     if not firebase_admin._apps:
-        firebase_admin.initialize_app(credentials.Certificate(key),{'databaseURL':url})
-    records=json.loads(df.to_json(orient='records',force_ascii=False))
-    db.reference('/rgr_variant_2/measurements').set(records)
-    downloaded=db.reference('/rgr_variant_2/measurements').get()
-    (OUT/'firebase_download.json').write_text(json.dumps(downloaded,ensure_ascii=False),encoding='utf8')
-    (OUT/'firebase_status.txt').write_text(f'Успішна передача і повторне отримання {len(downloaded)} записів.',encoding='utf8')
+        firebase_admin.initialize_app(credentials.Certificate(key), {'databaseURL': url})
+
+    original = df.to_json(orient='records', force_ascii=False).encode('utf8')
+    files = {'gzip': 'cleaned.json.gz', 'zlib': 'cleaned.json.zlib', 'bzip2': 'cleaned.json.bz2'}
+    compressed = (OUT/files[best]).read_bytes()
+    decompressors = {'gzip': gzip.decompress, 'zlib': zlib.decompress, 'bzip2': bz2.decompress}
+    assert decompressors[best](compressed) == original, 'Локальна перевірка стиснення не пройшла'
+
+    sha = hashlib.sha256(original).hexdigest()
+    packet = {
+        'algorithm': best,
+        'encoding': 'base64',
+        'format': 'json-records',
+        'record_count': len(df),
+        'original_bytes': len(original),
+        'compressed_bytes': len(compressed),
+        'sha256_original': sha,
+        'payload_base64': base64.b64encode(compressed).decode('ascii'),
+    }
+    root = db.reference('/rgr_variant_2/compressed_dataset')
+    root.set(packet)
+    remote = root.get()
+    if not isinstance(remote, dict):
+        raise RuntimeError('Firebase не повернув об’єкт зі стисненими даними')
+    remote_bytes = base64.b64decode(remote['payload_base64'], validate=True)
+    if len(remote_bytes) != remote['compressed_bytes']:
+        raise ValueError('Кількість байтів після отримання з Firebase не збігається')
+    recovered = decompressors[remote['algorithm']](remote_bytes)
+    if hashlib.sha256(recovered).hexdigest() != remote['sha256_original'] or recovered != original:
+        raise ValueError('Вміст після зворотного завантаження не збігається з оригіналом')
+    restored_records = json.loads(recovered.decode('utf8'))
+    if len(restored_records) != remote['record_count']:
+        raise ValueError('Порушена кількість відновлених записів')
+
+    (OUT/'firebase_download.json').write_text(
+        json.dumps(restored_records, ensure_ascii=False, indent=2), encoding='utf8')
+    verified = {
+        'cloud_transfer': 'success', 'algorithm': best,
+        'record_count': len(restored_records),
+        'original_bytes': len(original), 'compressed_bytes': len(remote_bytes),
+        'sha256': sha, 'byte_identical': True,
+    }
+    (OUT/'firebase_verification.json').write_text(
+        json.dumps(verified, ensure_ascii=False, indent=2), encoding='utf8')
+    (OUT/'firebase_status.txt').write_text(
+        'Firebase: стиснений пакет завантажено і зчитано назад; '
+        f'{len(restored_records)} записів, алгоритм {best}, SHA-256 збігається.',
+        encoding='utf8')
+    print('FIREBASE VERIFIED:', len(restored_records), 'records;', best, '; SHA-256 OK')
     return True
 
 if __name__=='__main__':
-    raw=simulate();cleaned=clean(raw);dbpath,n=database(cleaned);plots(cleaned);best,summary=compress(cleaned);report(cleaned,n,best,summary)
+    raw=simulate();cleaned=clean(raw);dbpath,n=database(cleaned);plots(cleaned)
+    best,summary=compress(cleaned);report(cleaned,n,best,summary)
     (OUT/'firebase_upload_payload.json').write_text(cleaned.to_json(orient='records',force_ascii=False),encoding='utf8')
-    firebase_upload(cleaned)
+    firebase_upload(cleaned, best)
     print(f'Результати: {OUT}')
